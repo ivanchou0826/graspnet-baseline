@@ -1,17 +1,31 @@
-"""GraspNet ROS2 node.
+"""GraspNet ROS2 node (colcon-installable package version).
 
-Subscribes to RGB, depth, and camera_info topics, runs GraspNet inference,
-and publishes a visualization image with projected gripper rectangles.
+Path to the graspnet-baseline repo is resolved via the GRASPNET_ROOT
+environment variable (set by the launch file or manually).
 """
 
 import os
 import sys
 
-# Allow running with venv while ROS2 packages live in the system Python path.
-# Adjust if your ROS distro or Python version differs.
-_ROS_PYTHON = f"/opt/ros/{os.environ.get('ROS_DISTRO', 'humble')}/local/lib/python3.10/dist-packages"
-if _ROS_PYTHON not in sys.path:
-    sys.path.insert(0, _ROS_PYTHON)
+# ROS2 Python packages (needed when running inside a venv)
+_ros_distro = os.environ.get('ROS_DISTRO', 'humble')
+_ros_site = f'/opt/ros/{_ros_distro}/local/lib/python3.10/dist-packages'
+if _ros_site not in sys.path:
+    sys.path.insert(0, _ros_site)
+
+# GraspNet-baseline source root — must be set before importing graspnet modules
+GRASPNET_ROOT = os.environ.get('GRASPNET_ROOT', '')
+if not GRASPNET_ROOT:
+    raise RuntimeError(
+        'Environment variable GRASPNET_ROOT is not set. '
+        'Point it to the graspnet-baseline repository root, e.g.:\n'
+        '  export GRASPNET_ROOT=/path/to/graspnet-baseline\n'
+        'or use the provided launch file which sets it automatically.')
+
+for _sub in ('models', 'utils', 'dataset'):
+    _p = os.path.join(GRASPNET_ROOT, _sub)
+    if _p not in sys.path:
+        sys.path.append(_p)
 
 import numpy as np
 import cv2
@@ -22,10 +36,6 @@ from rclpy.node import Node
 import message_filters
 from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
-
-ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(os.path.join(ROOT_DIR, 'models'))
-sys.path.append(os.path.join(ROOT_DIR, 'utils'))
 
 from graspnet import GraspNet, pred_decode
 from collision_detector import ModelFreeCollisionDetector
@@ -42,7 +52,7 @@ def _score_to_bgr(score: float, score_max: float = 1.2):
 
 
 def _project(pt3d, fx, fy, cx, cy):
-    """Project a 3-D point to pixel (u, v). Returns None if behind camera."""
+    """Project a 3-D world point to pixel (u, v). Returns None if behind camera."""
     x, y, z = pt3d
     if z <= 1e-4:
         return None
@@ -50,14 +60,16 @@ def _project(pt3d, fx, fy, cx, cy):
 
 
 def _draw_grasp(img, R, t, width, depth, score, fx, fy, cx, cy, score_max=1.2):
-    """Draw a projected gripper rectangle onto img (BGR, in-place)."""
-    # Gripper frame: X = depth axis (fingers point +X), Y = opening axis
+    """Draw a projected gripper rectangle onto img (BGR in-place).
+
+    Gripper local frame: X = depth/approach axis, Y = finger-opening axis.
+    """
     half_w = width / 2.0
     corners_local = np.array([
         [depth,  -half_w, 0.0],   # left  tip
         [depth,   half_w, 0.0],   # right tip
-        [0.0,     half_w, 0.0],   # right base
-        [0.0,    -half_w, 0.0],   # left  base
+        [0.0,     half_w, 0.0],   # right base (wrist)
+        [0.0,    -half_w, 0.0],   # left  base (wrist)
     ], dtype=np.float32)
 
     pixels = []
@@ -72,7 +84,7 @@ def _draw_grasp(img, R, t, width, depth, score, fx, fy, cx, cy, score_max=1.2):
     color = _score_to_bgr(score, score_max=score_max)
     cv2.polylines(img, [pts], isClosed=True, color=color, thickness=2)
 
-    # Mark approach direction: line from base-center toward tip-center
+    # Arrow from wrist-center toward fingertip-center = approach direction
     base_mid = ((pixels[2][0] + pixels[3][0]) // 2,
                 (pixels[2][1] + pixels[3][1]) // 2)
     tip_mid  = ((pixels[0][0] + pixels[1][0]) // 2,
@@ -84,8 +96,8 @@ class GraspNetNode(Node):
     def __init__(self):
         super().__init__('graspnet_node')
 
-        # ---------- parameters ----------
-        self.declare_parameter('checkpoint_path', './checkpoint-rs.tar')
+        # ---- parameters ----
+        self.declare_parameter('checkpoint_path', os.path.join(GRASPNET_ROOT, 'checkpoint-rs.tar'))
         self.declare_parameter('num_point', 20000)
         self.declare_parameter('num_view', 300)
         self.declare_parameter('collision_thresh', 0.01)
@@ -95,44 +107,38 @@ class GraspNetNode(Node):
         ckpt   = self.get_parameter('checkpoint_path').value
         n_view = self.get_parameter('num_view').value
 
-        # ---------- model ----------
-        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-        self.device = device
+        # ---- model ----
+        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         net = GraspNet(input_feature_dim=0, num_view=n_view, num_angle=12, num_depth=4,
                        cylinder_radius=0.05, hmin=-0.02,
                        hmax_list=[0.01, 0.02, 0.03, 0.04], is_training=False)
-        net.to(device)
-        checkpoint = torch.load(ckpt, map_location=device)
+        net.to(self.device)
+        checkpoint = torch.load(ckpt, map_location=self.device)
         net.load_state_dict(checkpoint['model_state_dict'])
-        self.get_logger().info(
-            f"Loaded checkpoint '{ckpt}' (epoch {checkpoint['epoch']})")
+        self.get_logger().info(f"Loaded checkpoint '{ckpt}' (epoch {checkpoint['epoch']})")
         net.eval()
         self.net = net
-
-        # ---------- misc ----------
         self.bridge = CvBridge()
 
-        # ---------- subscriptions (synchronized) ----------
+        # ---- synchronized subscriptions ----
         qos = rclpy.qos.QoSProfile(depth=10)
-        sub_rgb   = message_filters.Subscriber(self, Image, '/camera_2/image',   qos_profile=qos)
-        sub_depth = message_filters.Subscriber(self, Image, '/camera_2/depth',   qos_profile=qos)
-        sub_info  = message_filters.Subscriber(self, CameraInfo, '/camera_2/info', qos_profile=qos)
-
+        sub_rgb   = message_filters.Subscriber(self, Image,       '/camera_2/image', qos_profile=qos)
+        sub_depth = message_filters.Subscriber(self, Image,       '/camera_2/depth', qos_profile=qos)
+        sub_info  = message_filters.Subscriber(self, CameraInfo,  '/camera_2/info',  qos_profile=qos)
         self.sync = message_filters.ApproximateTimeSynchronizer(
             [sub_rgb, sub_depth, sub_info], queue_size=10, slop=0.1)
         self.sync.registerCallback(self.callback)
 
-        # ---------- publisher ----------
+        # ---- publisher ----
         self.pub = self.create_publisher(Image, '/graspnet/visualization', 10)
         self.get_logger().info('GraspNet node ready — waiting for camera topics...')
 
     # ------------------------------------------------------------------
     def callback(self, rgb_msg: Image, depth_msg: Image, info_msg: CameraInfo):
-        # --- decode ROS images ---
+        # Convert ROS images to numpy
         color_bgr = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='bgr8')
         color_rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
 
-        # Auto-detect depth encoding: 16UC1 (mm) or 32FC1 (meters)
         enc = depth_msg.encoding.lower()
         if '16' in enc:
             depth_raw = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='16UC1')
@@ -141,34 +147,31 @@ class GraspNetNode(Node):
             depth_raw = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='32FC1')
             factor_depth = 1.0
 
-        # --- camera intrinsics ---
-        K = info_msg.k          # row-major 3×3 flattened
+        K  = info_msg.k
         fx, fy = K[0], K[4]
         cx, cy = K[2], K[5]
         H, W   = depth_raw.shape[:2]
 
-        # --- point cloud ---
-        cam_info = GraspCameraInfo(float(W), float(H), fx, fy, cx, cy, factor_depth)
-        cloud_organized = create_point_cloud_from_depth_image(
-            depth_raw, cam_info, organized=True)
+        # Build point cloud
+        cam = GraspCameraInfo(float(W), float(H), fx, fy, cx, cy, factor_depth)
+        cloud_org = create_point_cloud_from_depth_image(depth_raw, cam, organized=True)
 
         mask = (depth_raw > 0)
-        cloud_masked = cloud_organized[mask]            # (N, 3)
-        color_masked = (color_rgb / 255.0)[mask]        # (N, 3)
+        cloud_masked = cloud_org[mask]
+        color_masked = (color_rgb / 255.0)[mask]
 
         if len(cloud_masked) == 0:
             self.get_logger().warn('No valid depth points — skipping frame.')
             return
 
-        # --- sample to num_point ---
+        # Sample to num_point
         num_point = self.get_parameter('num_point').value
         if len(cloud_masked) >= num_point:
             idxs = np.random.choice(len(cloud_masked), num_point, replace=False)
         else:
             idxs = np.concatenate([
                 np.arange(len(cloud_masked)),
-                np.random.choice(len(cloud_masked),
-                                 num_point - len(cloud_masked), replace=True)
+                np.random.choice(len(cloud_masked), num_point - len(cloud_masked), replace=True),
             ])
         cloud_sampled = cloud_masked[idxs].astype(np.float32)
 
@@ -176,7 +179,7 @@ class GraspNetNode(Node):
             'point_clouds': torch.from_numpy(cloud_sampled[np.newaxis]).to(self.device)
         }
 
-        # --- inference ---
+        # Inference
         with torch.no_grad():
             end_points = self.net(end_points)
             grasp_preds = pred_decode(end_points)
@@ -184,51 +187,49 @@ class GraspNetNode(Node):
         gg_array = grasp_preds[0].detach().cpu().numpy()
         if len(gg_array) == 0:
             self.get_logger().warn('No grasps predicted.')
-            self._publish_image(color_bgr, rgb_msg.header)
+            self._publish(color_bgr, rgb_msg.header)
             return
         gg = GraspGroup(gg_array)
 
-        # --- collision detection ---
+        # Collision detection
         collision_thresh = self.get_parameter('collision_thresh').value
         voxel_size       = self.get_parameter('voxel_size').value
         if collision_thresh > 0:
             detector = ModelFreeCollisionDetector(cloud_masked, voxel_size=voxel_size)
-            collision_mask = detector.detect(
-                gg, approach_dist=0.05, collision_thresh=collision_thresh)
+            collision_mask = detector.detect(gg, approach_dist=0.05, collision_thresh=collision_thresh)
             gg = gg[~collision_mask]
 
         gg = gg.nms().sort_by_score()
         top_k = self.get_parameter('top_k').value
         gg = gg[:top_k]
-        self.get_logger().info(f'Visualizing {len(gg)} grasps (top {top_k}).')
+        self.get_logger().info(f'Visualizing {len(gg)} grasps.')
 
-        # --- draw grasps on BGR image ---
+        # Draw grasps
         vis = color_bgr.copy()
-        translations     = gg.translations       # (M, 3)
-        rotation_mats    = gg.rotation_matrices  # (M, 3, 3)
-        scores           = gg.scores             # (M,)
-        widths           = gg.widths             # (M,)
-        depths           = gg.depths             # (M,)
+        translations  = gg.translations       # (M, 3)
+        rotations     = gg.rotation_matrices  # (M, 3, 3)
+        scores        = gg.scores             # (M,)
+        widths        = gg.widths             # (M,)
+        depths        = gg.depths             # (M,)
+        score_max     = float(scores.max()) if len(scores) > 0 else 1.0
 
-        score_max = float(scores.max()) if len(scores) > 0 else 1.0
         for i in range(len(gg)):
             _draw_grasp(vis,
-                        R=rotation_mats[i], t=translations[i],
+                        R=rotations[i], t=translations[i],
                         width=widths[i], depth=depths[i],
                         score=scores[i], score_max=score_max,
                         fx=fx, fy=fy, cx=cx, cy=cy)
 
-        self._publish_image(vis, rgb_msg.header)
+        self._publish(vis, rgb_msg.header)
 
-    # ------------------------------------------------------------------
-    def _publish_image(self, bgr_img, header):
+    def _publish(self, bgr_img, header):
         msg = self.bridge.cv2_to_imgmsg(bgr_img, encoding='bgr8')
         msg.header = header
         self.pub.publish(msg)
 
 
-def main():
-    rclpy.init()
+def main(args=None):
+    rclpy.init(args=args)
     node = GraspNetNode()
     try:
         rclpy.spin(node)
