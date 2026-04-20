@@ -3,9 +3,15 @@
 Camera topics are cached continuously; inference runs only when the service
 is called, reducing CPU/GPU load and eliminating visualization jitter.
 
-Optional: subscribe to /detections_output (vision_msgs/Detection2DArray) from
-upstream detectors (YOLOv8, RT-DETR, etc.) to restrict point cloud to ROI
+Optional: subscribe to one or more detection topics (vision_msgs/Detection2DArray)
+from upstream detectors (YOLOv8, RT-DETR, etc.) to restrict point cloud to ROI
 bounding boxes before running GraspNet inference.
+
+Configure via the 'det_topics' string-array parameter (changeable at runtime):
+  ros2 param set /graspnet_node det_topics \
+    "['/detections/blue_cube', '/detections/green_cube']"
+All active topics are merged at trigger time; each Detection2D bbox is treated
+independently, so multiple instances of the same class are fully supported.
 """
 
 import os
@@ -35,6 +41,7 @@ import torch
 
 import rclpy
 from rclpy.node import Node
+from rcl_interfaces.msg import SetParametersResult
 import message_filters
 from sensor_msgs.msg import Image, CameraInfo
 from std_srvs.srv import Trigger
@@ -47,6 +54,18 @@ from graspnet import GraspNet, pred_decode
 from collision_detector import ModelFreeCollisionDetector
 from data_utils import CameraInfo as GraspCameraInfo, create_point_cloud_from_depth_image
 from graspnetAPI import GraspGroup
+
+# Distinct colors (BGR) cycled across detection topics for visualization
+_TOPIC_COLORS = [
+    (0,   255, 255),   # yellow
+    (255, 128,   0),   # blue
+    (0,   255,   0),   # green
+    (0,   100, 255),   # orange
+    (255,   0, 255),   # magenta
+    (255,   0,   0),   # pure blue
+    (0,   128, 255),   # amber
+    (128,   0, 128),   # purple
+]
 
 
 def _imgmsg_to_numpy(msg: Image):
@@ -160,14 +179,14 @@ def _make_gripper_marker(marker_id, R, t, width, depth, score, score_max, header
     """Build a LINE_LIST Marker showing the gripper shape in 3D."""
     half_w = width / 2.0
     pts_local = np.array([
-        [0.0,     -half_w, 0.0],   # left  base
-        [depth,   -half_w, 0.0],   # left  tip
-        [0.0,      half_w, 0.0],   # right base
-        [depth,    half_w, 0.0],   # right tip
-        [0.0,     -half_w, 0.0],   # palm bar start
-        [0.0,      half_w, 0.0],   # palm bar end
-        [-0.04,    0.0,    0.0],   # wrist back
-        [0.0,      0.0,    0.0],   # wrist front
+        [0.0,     -half_w, 0.0],
+        [depth,   -half_w, 0.0],
+        [0.0,      half_w, 0.0],
+        [depth,    half_w, 0.0],
+        [0.0,     -half_w, 0.0],
+        [0.0,      half_w, 0.0],
+        [-0.04,    0.0,    0.0],
+        [0.0,      0.0,    0.0],
     ], dtype=np.float32)
 
     pairs = [(0, 1), (2, 3), (4, 5), (6, 7)]
@@ -200,7 +219,6 @@ def _make_gripper_marker(marker_id, R, t, width, depth, score, score_max, header
 
 
 def _make_score_text_marker(marker_id, t, score, header):
-    """Floating score label above the grasp centre."""
     m = Marker()
     m.header = header
     m.ns = 'graspnet_text'
@@ -223,7 +241,6 @@ def _make_score_text_marker(marker_id, t, score, header):
 
 
 def _rotation_to_quaternion(R):
-    """Convert 3x3 rotation matrix to (x, y, z, w) quaternion."""
     trace = R[0, 0] + R[1, 1] + R[2, 2]
     if trace > 0:
         s = 0.5 / np.sqrt(trace + 1.0)
@@ -267,11 +284,12 @@ class GraspNetNode(Node):
         self.declare_parameter('remove_plane', True)
         self.declare_parameter('plane_dist_thresh', 0.01)
         # detection ROI parameters
+        self.declare_parameter('det_topics',       ['/detections_output'])  # string array
         self.declare_parameter('det_input_width',  0)    # 0 = same resolution as depth image
         self.declare_parameter('det_input_height', 0)
         self.declare_parameter('det_score_thresh', 0.5)
         self.declare_parameter('det_class_filter', '')   # comma-separated; empty = all classes
-        self.declare_parameter('det_timeout_sec',  3.0)  # ignore stale detections
+        self.declare_parameter('det_timeout_sec',  3.0)
 
         ckpt   = self.get_parameter('checkpoint_path').value
         n_view = self.get_parameter('num_view').value
@@ -288,27 +306,31 @@ class GraspNetNode(Node):
         net.eval()
         self.net = net
 
-        # ---- cached frames (updated by subscribers, consumed by service) ----
+        # ---- cached camera frames ----
         self._latest_rgb   = None
         self._latest_depth = None
         self._latest_info  = None
 
-        # ---- detection cache (optional, from YOLOv8 / RT-DETR etc.) ----
-        self._latest_detections       = None   # Detection2DArray msg
-        self._latest_detections_stamp = None   # rclpy.time.Time when received
+        # ---- detection caches: topic → (Detection2DArray, received_time) ----
+        self._det_subs:   dict = {}   # topic → Subscription
+        self._det_caches: dict = {}   # topic → (Detection2DArray, rclpy.time.Time)
 
         # ---- synchronized camera subscriptions ----
         qos = rclpy.qos.QoSProfile(depth=10)
-        sub_rgb   = message_filters.Subscriber(self, Image,       '/camera_2/image', qos_profile=qos)
-        sub_depth = message_filters.Subscriber(self, Image,       '/camera_2/depth', qos_profile=qos)
-        sub_info  = message_filters.Subscriber(self, CameraInfo,  '/camera_2/info',  qos_profile=qos)
+        sub_rgb   = message_filters.Subscriber(self, Image,      '/camera_2/image', qos_profile=qos)
+        sub_depth = message_filters.Subscriber(self, Image,      '/camera_2/depth', qos_profile=qos)
+        sub_info  = message_filters.Subscriber(self, CameraInfo, '/camera_2/info',  qos_profile=qos)
         self.sync = message_filters.ApproximateTimeSynchronizer(
             [sub_rgb, sub_depth, sub_info], queue_size=10, slop=0.1)
         self.sync.registerCallback(self._cache_frame)
 
-        # ---- optional detection subscription (independent of camera sync) ----
-        self.create_subscription(
-            Detection2DArray, '/detections_output', self._cache_detections, 10)
+        # ---- initial detection subscriptions ----
+        initial_topics = self.get_parameter('det_topics').value
+        for topic in initial_topics:
+            self._add_det_subscription(topic)
+
+        # ---- parameter change callback ----
+        self.add_on_set_parameters_callback(self._on_param_change)
 
         # ---- publishers ----
         self.pub_vis     = self.create_publisher(Image,        '/graspnet/visualization', 10)
@@ -322,8 +344,38 @@ class GraspNetNode(Node):
         self.get_logger().info('GraspNet node ready — call /graspnet/trigger to run inference.')
         self.get_logger().info('rviz2: add MarkerArray display on /graspnet/markers')
         self.get_logger().info(
-            'Optional: publish vision_msgs/Detection2DArray to /detections_output '
-            'to restrict inference to detected object ROIs.')
+            f'Detection topics: {initial_topics}  '
+            '(update at runtime: ros2 param set /graspnet_node det_topics "[...]")')
+
+    # ------------------------------------------------------------------
+    def _add_det_subscription(self, topic: str):
+        if topic in self._det_subs:
+            return
+        sub = self.create_subscription(
+            Detection2DArray, topic,
+            lambda msg, t=topic: self._cache_detections(t, msg),
+            10)
+        self._det_subs[topic] = sub
+        self.get_logger().info(f'Subscribed to detection topic: {topic}')
+
+    def _remove_det_subscription(self, topic: str):
+        if topic not in self._det_subs:
+            return
+        self.destroy_subscription(self._det_subs.pop(topic))
+        self._det_caches.pop(topic, None)
+        self.get_logger().info(f'Unsubscribed from detection topic: {topic}')
+
+    # ------------------------------------------------------------------
+    def _on_param_change(self, params):
+        for p in params:
+            if p.name == 'det_topics':
+                new_topics = set(p.value)
+                old_topics = set(self._det_subs.keys())
+                for t in old_topics - new_topics:
+                    self._remove_det_subscription(t)
+                for t in new_topics - old_topics:
+                    self._add_det_subscription(t)
+        return SetParametersResult(successful=True)
 
     # ------------------------------------------------------------------
     def _cache_frame(self, rgb_msg: Image, depth_msg: Image, info_msg: CameraInfo):
@@ -331,106 +383,127 @@ class GraspNetNode(Node):
         self._latest_depth = depth_msg
         self._latest_info  = info_msg
 
-    # ------------------------------------------------------------------
-    def _cache_detections(self, msg: Detection2DArray):
-        self._latest_detections       = msg
-        self._latest_detections_stamp = self.get_clock().now()
+    def _cache_detections(self, topic: str, msg: Detection2DArray):
+        self._det_caches[topic] = (msg, self.get_clock().now())
 
     # ------------------------------------------------------------------
     def _get_active_roi(self, img_H: int, img_W: int):
-        """Return (detections_msg, roi_mask) if a fresh detection cache exists, else (None, None).
+        """Merge all non-expired detection caches into a single ROI mask.
 
-        roi_mask is a bool HxW array in depth-image pixel space (True = keep point).
-        Bboxes are scaled from the detector's input resolution to depth image resolution.
+        Returns (active_caches, roi_mask) where:
+          active_caches: dict[topic, Detection2DArray] — only fresh entries
+          roi_mask:      bool HxW array, or None if no valid detections
         """
-        if self._latest_detections is None:
-            return None, None
+        timeout       = self.get_parameter('det_timeout_sec').value
+        det_w         = self.get_parameter('det_input_width').value
+        det_h         = self.get_parameter('det_input_height').value
+        score_thresh  = self.get_parameter('det_score_thresh').value
+        class_filter_str = self.get_parameter('det_class_filter').value
+        class_filter  = (set(c.strip() for c in class_filter_str.split(',') if c.strip())
+                         if class_filter_str else set())
 
-        age = (self.get_clock().now() - self._latest_detections_stamp).nanoseconds / 1e9
-        timeout = self.get_parameter('det_timeout_sec').value
-        if age > timeout:
-            self.get_logger().warn(
-                f'Detection cache is {age:.1f}s old (timeout={timeout}s) — ignoring ROI.')
-            return None, None
-
-        det_w = self.get_parameter('det_input_width').value
-        det_h = self.get_parameter('det_input_height').value
         scale_x = img_W / det_w if det_w > 0 else 1.0
         scale_y = img_H / det_h if det_h > 0 else 1.0
 
-        score_thresh = self.get_parameter('det_score_thresh').value
-        class_filter_str = self.get_parameter('det_class_filter').value
-        class_filter = (set(c.strip() for c in class_filter_str.split(',') if c.strip())
-                        if class_filter_str else set())
+        roi_mask      = np.zeros((img_H, img_W), dtype=bool)
+        active_caches = {}
+        n_boxes       = 0
 
-        roi_mask = np.zeros((img_H, img_W), dtype=bool)
-        n_accepted = 0
-
-        for det in self._latest_detections.detections:
-            if not det.results:
-                continue
-            best = max(det.results, key=lambda r: r.hypothesis.score)
-            if best.hypothesis.score < score_thresh:
-                continue
-            if class_filter and best.hypothesis.class_id not in class_filter:
+        for topic, (det_msg, stamp) in self._det_caches.items():
+            age = (self.get_clock().now() - stamp).nanoseconds / 1e9
+            if age > timeout:
+                self.get_logger().warn(
+                    f'Detection cache for "{topic}" is {age:.1f}s old — skipping.')
                 continue
 
-            cx = det.bbox.center.position.x * scale_x
-            cy = det.bbox.center.position.y * scale_y
-            sw = det.bbox.size_x * scale_x
-            sh = det.bbox.size_y * scale_y
+            accepted = 0
+            for det in det_msg.detections:
+                if not det.results:
+                    continue
+                best = max(det.results, key=lambda r: r.hypothesis.score)
+                if best.hypothesis.score < score_thresh:
+                    continue
+                if class_filter and best.hypothesis.class_id not in class_filter:
+                    continue
 
-            x1 = int(np.clip(cx - sw / 2, 0, img_W - 1))
-            y1 = int(np.clip(cy - sh / 2, 0, img_H - 1))
-            x2 = int(np.clip(cx + sw / 2, 0, img_W))
-            y2 = int(np.clip(cy + sh / 2, 0, img_H))
+                cx = det.bbox.center.position.x * scale_x
+                cy = det.bbox.center.position.y * scale_y
+                sw = det.bbox.size_x * scale_x
+                sh = det.bbox.size_y * scale_y
 
-            if x2 > x1 and y2 > y1:
-                roi_mask[y1:y2, x1:x2] = True
-                n_accepted += 1
+                x1 = int(np.clip(cx - sw / 2, 0, img_W - 1))
+                y1 = int(np.clip(cy - sh / 2, 0, img_H - 1))
+                x2 = int(np.clip(cx + sw / 2, 0, img_W))
+                y2 = int(np.clip(cy + sh / 2, 0, img_H))
 
-        if n_accepted == 0:
-            self.get_logger().warn('Detections received but none passed score/class filter.')
-            return self._latest_detections, None
+                if x2 > x1 and y2 > y1:
+                    roi_mask[y1:y2, x1:x2] = True
+                    accepted += 1
 
-        return self._latest_detections, roi_mask
+            if accepted > 0:
+                active_caches[topic] = det_msg
+                n_boxes += accepted
+
+        if n_boxes == 0:
+            if self._det_caches:
+                self.get_logger().warn(
+                    'Detection caches present but no bbox passed score/class filter.')
+            return {}, None
+
+        self.get_logger().info(
+            f'ROI: {n_boxes} bbox(es) from {len(active_caches)} topic(s) → '
+            f'{int(roi_mask.sum())} pixels.')
+        return active_caches, roi_mask
 
     # ------------------------------------------------------------------
-    def _draw_detection_boxes(self, vis_img: np.ndarray, detections_msg: Detection2DArray,
+    def _draw_detection_boxes(self, vis_img: np.ndarray,
+                               active_caches: dict,
                                img_H: int, img_W: int):
-        """Overlay scaled detection bounding boxes on vis_img in-place (yellow)."""
+        """Draw scaled detection bboxes on vis_img in-place.
+
+        Each topic gets a distinct color from _TOPIC_COLORS; topic name is
+        shown in the top-left corner of the first bbox of each topic.
+        """
         det_w = self.get_parameter('det_input_width').value
         det_h = self.get_parameter('det_input_height').value
+        score_thresh = self.get_parameter('det_score_thresh').value
+
         scale_x = img_W / det_w if det_w > 0 else 1.0
         scale_y = img_H / det_h if det_h > 0 else 1.0
 
-        score_thresh = self.get_parameter('det_score_thresh').value
+        # Stable color assignment: sort topics so colors are deterministic
+        sorted_topics = sorted(active_caches.keys())
 
-        for det in detections_msg.detections:
-            if not det.results:
-                continue
-            best = max(det.results, key=lambda r: r.hypothesis.score)
-            if best.hypothesis.score < score_thresh:
-                continue
+        for t_idx, topic in enumerate(sorted_topics):
+            color = _TOPIC_COLORS[t_idx % len(_TOPIC_COLORS)]
+            det_msg = active_caches[topic]
+            topic_short = topic.split('/')[-1]   # last path segment for brevity
 
-            cx = det.bbox.center.position.x * scale_x
-            cy = det.bbox.center.position.y * scale_y
-            sw = det.bbox.size_x * scale_x
-            sh = det.bbox.size_y * scale_y
+            for det in det_msg.detections:
+                if not det.results:
+                    continue
+                best = max(det.results, key=lambda r: r.hypothesis.score)
+                if best.hypothesis.score < score_thresh:
+                    continue
 
-            x1 = int(np.clip(cx - sw / 2, 0, img_W - 1))
-            y1 = int(np.clip(cy - sh / 2, 0, img_H - 1))
-            x2 = int(np.clip(cx + sw / 2, 0, img_W))
-            y2 = int(np.clip(cy + sh / 2, 0, img_H))
+                cx = det.bbox.center.position.x * scale_x
+                cy = det.bbox.center.position.y * scale_y
+                sw = det.bbox.size_x * scale_x
+                sh = det.bbox.size_y * scale_y
 
-            cv2.rectangle(vis_img, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                x1 = int(np.clip(cx - sw / 2, 0, img_W - 1))
+                y1 = int(np.clip(cy - sh / 2, 0, img_H - 1))
+                x2 = int(np.clip(cx + sw / 2, 0, img_W))
+                y2 = int(np.clip(cy + sh / 2, 0, img_H))
 
-            label = f'{best.hypothesis.class_id} {best.hypothesis.score:.2f}'
-            lx, ly = x1, max(y1 - 6, 12)
-            cv2.putText(vis_img, label, (lx, ly),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
-            cv2.putText(vis_img, label, (lx, ly),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+                cv2.rectangle(vis_img, (x1, y1), (x2, y2), color, 2)
+
+                label = f'{topic_short}:{best.hypothesis.class_id} {best.hypothesis.score:.2f}'
+                lx, ly = x1, max(y1 - 6, 12)
+                cv2.putText(vis_img, label, (lx, ly),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(vis_img, label, (lx, ly),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
     # ------------------------------------------------------------------
     def _trigger_cb(self, request, response):
@@ -471,13 +544,10 @@ class GraspNetNode(Node):
         max_depth = self.get_parameter('max_depth').value
         mask = (depth_raw > 0) & (depth_raw < max_depth)
 
-        # Apply detection ROI if available
-        active_detections, roi_mask = self._get_active_roi(H, W)
+        # Apply detection ROI if any active topic cache is available
+        active_caches, roi_mask = self._get_active_roi(H, W)
         if roi_mask is not None:
             mask = mask & roi_mask
-            self.get_logger().info(
-                f'Detection ROI applied: {int(roi_mask.sum())} ROI pixels from '
-                f'{len(active_detections.detections)} detection(s).')
 
         cloud_masked = cloud_org[mask]
         color_masked = (color_rgb / 255.0)[mask]
@@ -502,7 +572,6 @@ class GraspNetNode(Node):
             if len(cloud_masked) < 100:
                 return 'Too few points after plane removal — skipping frame.'
 
-        # Publish colored object point cloud (full resolution, plane removed)
         self.pub_cloud.publish(_build_pointcloud2(cloud_masked, color_masked, rgb_msg.header))
 
         num_point = self.get_parameter('num_point').value
@@ -526,8 +595,8 @@ class GraspNetNode(Node):
         gg_array = grasp_preds[0].detach().cpu().numpy()
         if len(gg_array) == 0:
             vis = color_bgr.copy()
-            if active_detections is not None:
-                self._draw_detection_boxes(vis, active_detections, H, W)
+            if active_caches:
+                self._draw_detection_boxes(vis, active_caches, H, W)
             self._pub_vis(vis, rgb_msg.header)
             return 'No grasps predicted.'
         gg = GraspGroup(gg_array)
@@ -568,10 +637,10 @@ class GraspNetNode(Node):
         self.get_logger().info(f'Found {n_grasps} grasps (1 per object cluster).')
         score_max = float(scores.max()) if n_grasps > 0 else 1.0
 
-        # Publish visualization: detection boxes (yellow) underneath grasp overlays
+        # Visualization: detection boxes first, then grasp overlays on top
         vis = color_bgr.copy()
-        if active_detections is not None:
-            self._draw_detection_boxes(vis, active_detections, H, W)
+        if active_caches:
+            self._draw_detection_boxes(vis, active_caches, H, W)
         for i in range(n_grasps):
             _draw_grasp(vis,
                         R=rotations[i], t=translations[i],
@@ -580,7 +649,7 @@ class GraspNetNode(Node):
                         fx=fx, fy=fy, cx=cx, cy=cy)
         self._pub_vis(vis, rgb_msg.header)
 
-        # Publish 3D gripper markers for rviz2
+        # 3D gripper markers for rviz2
         ma = MarkerArray()
         del_marker = Marker()
         del_marker.header = rgb_msg.header
@@ -595,7 +664,7 @@ class GraspNetNode(Node):
                 i, translations[i], scores[i], rgb_msg.header))
         self.pub_markers.publish(ma)
 
-        # Publish best grasp as PoseStamped (camera frame)
+        # Best grasp as PoseStamped
         if n_grasps > 0:
             best_idx = int(np.argmax(scores))
             pose_msg = PoseStamped()
@@ -611,7 +680,8 @@ class GraspNetNode(Node):
             pose_msg.pose.orientation.w = qw
             self.pub_grasp.publish(pose_msg)
             self.get_logger().info(
-                f'Best grasp: score={scores[best_idx]:.3f} pos=({t[0]:.3f},{t[1]:.3f},{t[2]:.3f})')
+                f'Best grasp: score={scores[best_idx]:.3f} '
+                f'pos=({t[0]:.3f},{t[1]:.3f},{t[2]:.3f})')
 
         return f'Done: {n_grasps} grasps found, best score={score_max:.3f}'
 

@@ -80,7 +80,7 @@ Inference only runs when the service is called — the node continuously caches 
 | `/camera_2/image` | sub | `sensor_msgs/Image` | RGB input |
 | `/camera_2/depth` | sub | `sensor_msgs/Image` | Depth input (16UC1 or 32FC1) |
 | `/camera_2/info` | sub | `sensor_msgs/CameraInfo` | Camera intrinsics |
-| `/detections_output` | sub (optional) | `vision_msgs/Detection2DArray` | Object detections from YOLOv8/RT-DETR; restricts point cloud to ROI bboxes |
+| (configurable) | sub (optional) | `vision_msgs/Detection2DArray` | One or more detection topics from YOLOv8/RT-DETR; set via `det_topics` parameter |
 | `/graspnet/visualization` | pub | `sensor_msgs/Image` | BGR image with detection boxes (yellow) and grasp overlays |
 | `/graspnet/best_grasp` | pub | `geometry_msgs/PoseStamped` | Highest-score grasp pose (camera frame) |
 | `/graspnet/markers` | pub | `visualization_msgs/MarkerArray` | 3D gripper LINE_LIST markers for rviz2 |
@@ -94,13 +94,24 @@ Inference only runs when the service is called — the node continuously caches 
 - `max_depth` (2.0 m) — depth cutoff for point cloud masking
 - `remove_plane` (true) — RANSAC plane removal to strip the table
 - `plane_dist_thresh` (0.01 m) — RANSAC inlier threshold
-- `det_input_width` / `det_input_height` (0) — detector model input resolution; 0 = same as depth image (no scaling needed)
+- `det_topics` (`['/detections_output']`) — string array of detection topic names; add/remove at runtime via `ros2 param set`
+- `det_input_width` / `det_input_height` (0) — detector model input resolution; 0 = same as depth image (no scaling)
 - `det_score_thresh` (0.5) — ignore detections below this confidence
 - `det_class_filter` ("") — comma-separated class_id whitelist; empty = accept all classes
 - `det_timeout_sec` (3.0) — ignore cached detections older than this (seconds)
 
 **Detection ROI flow:**
-When `/detections_output` is received, each `Detection2D.bbox` (in detector pixel space) is scaled to depth image resolution using `scale = depth_size / det_input_size`. The union of all accepted bboxes forms a binary ROI mask that is ANDed with the depth validity mask before point cloud extraction. If no detections arrive (or they time out), the full depth image is used unchanged.
+Each topic in `det_topics` gets its own subscription and cache. At trigger time all non-expired caches are merged: each `Detection2D.bbox` (in detector pixel space) is scaled to depth image resolution (`scale = depth_size / det_input_size`) and unioned into a single binary ROI mask, which is ANDed with the depth validity mask before point cloud extraction. Multiple instances of the same object (multiple bboxes in one topic) and multiple object classes (multiple topics) are both handled this way. Downstream DBSCAN clustering then groups spatially close grasps into one best grasp per object. Each topic's bboxes are drawn in a distinct color on `/graspnet/visualization`.
+
+**Changing detection topics at runtime (no restart needed):**
+```bash
+# Subscribe to three object-specific topics
+ros2 param set /graspnet_node det_topics \
+  "['/detections/blue_cube', '/detections/green_cube', '/detections/red_cube']"
+
+# Revert to default single topic
+ros2 param set /graspnet_node det_topics "['/detections_output']"
+```
 
 ## Architecture
 
