@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-GraspNet-Baseline is a deep learning framework for 6-DoF grasp detection from RGB-D point clouds, the baseline model for the GraspNet-1Billion benchmark (CVPR 2020). It predicts grasp poses and tolerance/robustness scores for robotic manipulation.
+GraspNet-Baseline is a deep learning framework for 6-DoF grasp detection from RGB-D point clouds, the baseline model for the GraspNet-1Billion benchmark (CVPR 2020). This repo also contains a ROS2 node (`graspnet_ros2/`) that wraps the model for real-time robotic manipulation.
 
 ## Setup & Installation
 
@@ -12,20 +12,16 @@ GraspNet-Baseline is a deep learning framework for 6-DoF grasp detection from RG
 pip install -r requirements.txt
 
 # Compile PointNet2 CUDA ops (required)
-cd pointnet2
-python setup.py install
-cd ..
+cd pointnet2 && python setup.py install && cd ..
 
 # Compile KNN CUDA ops (required)
-cd knn
-python setup.py install
-cd ..
+cd knn && python setup.py install && cd ..
 
 # Install graspnetAPI for evaluation
 pip install graspnetAPI
 ```
 
-Camera options: `realsense` or `kinect`.
+Pretrained weights: `checkpoint-rs.tar` (RealSense) and `checkpoint-kn.tar` (Kinect). The realsense model transfers better to new scenes.
 
 ## Common Commands
 
@@ -36,7 +32,7 @@ CUDA_VISIBLE_DEVICES=0 python train.py --camera realsense \
   --dataset_root /data/Benchmark/graspnet
 ```
 
-**Evaluate:**
+**Evaluate** (set `--collision_thresh -1` for fast inference):
 ```bash
 CUDA_VISIBLE_DEVICES=0 python test.py \
   --checkpoint_path logs/log_rs/checkpoint.tar \
@@ -44,49 +40,113 @@ CUDA_VISIBLE_DEVICES=0 python test.py \
   --dataset_root /data/Benchmark/graspnet
 ```
 
-**Run demo on sample data:**
+**Demo on sample data** (`doc/example_data/`):
 ```bash
 CUDA_VISIBLE_DEVICES=0 python demo.py \
-  --checkpoint_path logs/log_kn/checkpoint.tar
+  --checkpoint_path checkpoint-rs.tar
 ```
 
-**Generate tolerance labels:**
+**Generate tolerance labels** (not included in dataset download):
 ```bash
 cd dataset && bash command_generate_tolerance_label.sh
 ```
+
+## ROS2 Node
+
+The `graspnet_ros2/` package is a colcon Python package for ROS2 Humble.
+
+**Build and run:**
+```bash
+# From the humble_ws root
+colcon build --packages-select graspnet_ros2
+source install/setup.bash
+
+export GRASPNET_ROOT=/path/to/graspnet-baseline
+ros2 launch graspnet_ros2 graspnet.launch.py
+```
+
+The launch file auto-sets `GRASPNET_ROOT` to the repo root if not already set. To override the checkpoint or any parameter, pass arguments on the command line or edit `graspnet_ros2/launch/graspnet.launch.py`.
+
+**Trigger inference on demand:**
+```bash
+ros2 service call /graspnet/trigger std_srvs/srv/Trigger {}
+```
+
+Inference only runs when the service is called — the node continuously caches the latest synchronized RGB+depth+CameraInfo frame but does not run the GPU model continuously.
+
+**Topics:**
+| Topic | Direction | Type | Description |
+|---|---|---|---|
+| `/camera_2/image` | sub | `sensor_msgs/Image` | RGB input |
+| `/camera_2/depth` | sub | `sensor_msgs/Image` | Depth input (16UC1 or 32FC1) |
+| `/camera_2/info` | sub | `sensor_msgs/CameraInfo` | Camera intrinsics |
+| `/detections_output` | sub (optional) | `vision_msgs/Detection2DArray` | Object detections from YOLOv8/RT-DETR; restricts point cloud to ROI bboxes |
+| `/graspnet/visualization` | pub | `sensor_msgs/Image` | BGR image with detection boxes (yellow) and grasp overlays |
+| `/graspnet/best_grasp` | pub | `geometry_msgs/PoseStamped` | Highest-score grasp pose (camera frame) |
+| `/graspnet/markers` | pub | `visualization_msgs/MarkerArray` | 3D gripper LINE_LIST markers for rviz2 |
+| `/graspnet/pointcloud` | pub | `sensor_msgs/PointCloud2` | XYZRGB cloud after plane removal |
+
+**Node parameters** (all settable from launch file):
+- `checkpoint_path` — path to `.tar` checkpoint
+- `num_point` (20000) — points sampled for inference
+- `collision_thresh` (0.01) — set to -1 to skip collision filtering
+- `top_k` (50) — maximum grasps before DBSCAN clustering
+- `max_depth` (2.0 m) — depth cutoff for point cloud masking
+- `remove_plane` (true) — RANSAC plane removal to strip the table
+- `plane_dist_thresh` (0.01 m) — RANSAC inlier threshold
+- `det_input_width` / `det_input_height` (0) — detector model input resolution; 0 = same as depth image (no scaling needed)
+- `det_score_thresh` (0.5) — ignore detections below this confidence
+- `det_class_filter` ("") — comma-separated class_id whitelist; empty = accept all classes
+- `det_timeout_sec` (3.0) — ignore cached detections older than this (seconds)
+
+**Detection ROI flow:**
+When `/detections_output` is received, each `Detection2D.bbox` (in detector pixel space) is scaled to depth image resolution using `scale = depth_size / det_input_size`. The union of all accepted bboxes forms a binary ROI mask that is ANDed with the depth validity mask before point cloud extraction. If no detections arrive (or they time out), the full depth image is used unchanged.
 
 ## Architecture
 
 ### Two-Stage Network (`models/graspnet.py`)
 
-**Stage 1 — `GraspNetStage1`:** PointNet2 backbone (`models/backbone.py`) extracts hierarchical features from the input point cloud (20,000 points → 1,024 seed points with 256-dim features). `ApproachNet` predicts objectness and scores 300 candidate viewpoints per seed point.
+**Stage 1 — `GraspNetStage1`:** PointNet2 backbone (`models/backbone.py`) processes 20,000 input points through 4 Set Abstraction layers, downsampling to 1,024 seed points with 256-dim features. 2 Feature Propagation layers upsample back. `ApproachNet` then predicts objectness and scores 300 candidate approach viewpoints per seed point.
 
-**Stage 2 — `GraspNetStage2`:** `CloudCrop` extracts cylindrical local patches (radius=0.05m) around high-scoring seed points. `OperationNet` regresses grasp parameters: 12 in-plane angles × 4 depths × width. `ToleranceNet` predicts grasp robustness.
+**Stage 2 — `GraspNetStage2`:** `CloudCrop` cylinders (radius=0.05 m) are extracted around the top-scoring seed points. `OperationNet` regresses grasp parameters over a discrete grid: 12 in-plane rotation angles × 4 gripper depths × continuous width. `ToleranceNet` predicts grasp robustness scores on the same grid.
 
-**`pred_decode()`** converts raw network outputs into final grasp representations: (score, width, height, depth, rotation_matrix, center, object_id).
+**`pred_decode()`** converts the raw tensor outputs into a flat array of grasp tuples: `(score, width, height, depth, rotation_matrix, center, object_id)` consumed by `GraspGroup` from graspnetAPI.
 
 ### Data Flow
 ```
-RGB-D → Point Cloud → PointNet2 → Stage1: viewpoint scores
-                                → Stage2: grasp params (angle/width/depth/tolerance)
-                                → Collision filtering → Grasp output
+RGB-D image
+  → create_point_cloud_from_depth_image()   [utils/data_utils.py]
+  → sample 20k points
+  → GraspNetStage1: PointNet2 → viewpoint scores
+  → GraspNetStage2: CloudCrop → OperationNet/ToleranceNet → grasp grid
+  → pred_decode() → GraspGroup
+  → ModelFreeCollisionDetector (optional)
+  → nms() + sort_by_score() → top-K grasps
 ```
 
-### Key Modules
-- `models/backbone.py` — PointNet2 with 4 SA layers + 2 FP layers
+### ROS2 Node Post-Processing
+
+After model inference, the node applies:
+1. Collision filtering (`ModelFreeCollisionDetector` against the masked point cloud)
+2. NMS + score sort → top-K
+3. DBSCAN clustering (`eps=0.08 m`) to reduce to one best grasp per object
+
+### Key Files
+- `models/graspnet.py` — full network, `pred_decode()`
+- `models/backbone.py` — PointNet2 (SA + FP layers)
 - `models/modules.py` — ApproachNet, CloudCrop, OperationNet, ToleranceNet
-- `models/loss.py` — Objectness (CE) + View (MSE) + Grasp (Huber) losses; grasp loss weighted at 0.2×
-- `dataset/graspnet_dataset.py` — GraspNetDataset, train/test splits, collision labels
-- `utils/collision_detector.py` — ModelFreeCollisionDetector for post-processing
-- `utils/data_utils.py` — Point cloud processing, camera projection utilities
-- `utils/loss_utils.py` — Grasp parameter constants (num_view=300, num_angle=12, num_depth=4)
+- `models/loss.py` — Objectness (CE) + View (MSE) + Grasp (Huber); grasp loss weighted 0.2×
+- `dataset/graspnet_dataset.py` — GraspNetDataset, train/test splits, collision label loading
+- `utils/collision_detector.py` — ModelFreeCollisionDetector
+- `utils/data_utils.py` — point cloud projection, CameraInfo class
+- `utils/loss_utils.py` — grasp parameter constants (`num_view=300`, `num_angle=12`, `num_depth=4`)
+- `graspnet_ros2/graspnet_ros2/graspnet_node.py` — ROS2 node (GraspNetNode)
+- `graspnet_ros2/launch/graspnet.launch.py` — launch file with parameter defaults
 
 ### Dataset Splits
 - Train: scenes 0–99
-- Test Seen: scenes 100–129
-- Test Similar: scenes 130–159
-- Test Novel: scenes 160–189
+- Test Seen: scenes 100–129 | Test Similar: 130–159 | Test Novel: 160–189
 
 ### Demo Data Format (`doc/example_data/`)
 - `color.png`, `depth.png`, `workspace_mask.png`
-- `meta.mat` with `intrinsic_matrix` and `factor_depth`
+- `meta.mat` with `intrinsic_matrix` and `factor_depth` (scale to convert raw depth to meters)

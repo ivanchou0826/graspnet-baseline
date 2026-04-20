@@ -25,6 +25,9 @@ def generate_launch_description():
                 'collision_thresh': 0.01,
                 'voxel_size':       0.01,
                 'top_k':            50,
+                'max_depth':        2.0,
+                'remove_plane':     True,
+                'plane_dist_thresh': 0.01,
             }],
         ),
     ])
