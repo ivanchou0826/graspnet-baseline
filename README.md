@@ -108,6 +108,40 @@ Evaluation results on Kinect camera:
 | In paper | 29.88  | 36.19            | 19.31            | 27.84  | 33.19            | 16.62            | 11.51  | 12.92            | 3.56             |
 | In repo  | 42.02  | 49.91            | 35.34            | 37.35  | 44.82            | 30.40            | 12.17  | 15.17            | 5.51             |
 
+## ROS2 Node Visualization
+
+The `/graspnet/visualization` image and `/graspnet/markers` MarkerArray use a **score-based color gradient** for grasps, plus per-topic colors for detection bounding boxes.
+
+### Grasp color (score gradient)
+
+Both the 2D image overlay and the 3D rviz2 LINE_LIST markers use the same mapping:
+
+| Color | Score | Meaning |
+|:---:|:---:|---|
+| **Red** | 0.0 | Low confidence — grasp geometry poorly supported by point cloud |
+| **Yellow / Orange** | ~0.5–0.8 | Medium confidence |
+| **Green** | ≥ 1.0–1.2 | High confidence — good force-closure geometry |
+
+> Score range is typically **0 – ~1.4**. The gradient is normalized to `score_max` (the highest score in the current result set), so colors are always relative to the best grasp in each inference.
+
+### Detection bounding box colors (2D overlay only)
+
+When detection topics (`det_topics`) are active, each topic is drawn in a distinct fixed color:
+
+| Order | Color |
+|:---:|---|
+| 1st topic | Yellow |
+| 2nd topic | Blue |
+| 3rd topic | Green |
+| 4th topic | Orange |
+| 5th+ | Magenta, Pure blue, Amber, Purple (cycled) |
+
+Topic assignment is sorted alphabetically to keep colors stable across triggers.
+
+### Arrow on 2D overlay
+
+Each grasp rectangle has an **arrow** pointing from the palm base toward the fingertip — indicating the **approach direction** (the direction the gripper moves into the object).
+
 ## Citation
 Please cite our paper in your publications if it helps your research:
 ```

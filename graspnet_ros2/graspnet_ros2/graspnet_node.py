@@ -35,6 +35,8 @@ for _sub in ('models', 'utils', 'dataset'):
     if _p not in sys.path:
         sys.path.append(_p)
 
+import colorsys
+
 import numpy as np
 import cv2
 import torch
@@ -240,6 +242,47 @@ def _make_score_text_marker(marker_id, t, score, header):
     return m
 
 
+def _cluster_color_rgb(label: int, n_clusters: int):
+    """Return (r,g,b) float [0,1] for a cluster label, evenly spaced in HSV hue."""
+    hue = (label / max(n_clusters, 1)) % 1.0
+    r, g, b = colorsys.hsv_to_rgb(hue, 0.85, 1.0)
+    return float(r), float(g), float(b)
+
+
+def _make_gripper_marker_rgb(marker_id, ns, R, t, width, depth, r, g, b, alpha, header):
+    """LINE_LIST gripper marker with explicit RGBA color."""
+    half_w = width / 2.0
+    pts_local = np.array([
+        [0.0,    -half_w, 0.0],
+        [depth,  -half_w, 0.0],
+        [0.0,     half_w, 0.0],
+        [depth,   half_w, 0.0],
+        [0.0,    -half_w, 0.0],
+        [0.0,     half_w, 0.0],
+        [-0.04,   0.0,    0.0],
+        [0.0,     0.0,    0.0],
+    ], dtype=np.float32)
+    pairs = [(0, 1), (2, 3), (4, 5), (6, 7)]
+
+    m = Marker()
+    m.header = header
+    m.ns = ns
+    m.id = marker_id
+    m.type = Marker.LINE_LIST
+    m.action = Marker.ADD
+    m.scale.x = 0.004
+    m.color.r, m.color.g, m.color.b, m.color.a = r, g, b, alpha
+    m.lifetime.sec = 0
+    m.lifetime.nanosec = 0
+    for i, j in pairs:
+        for idx in (i, j):
+            world = t + R @ pts_local[idx]
+            p = Point()
+            p.x, p.y, p.z = float(world[0]), float(world[1]), float(world[2])
+            m.points.append(p)
+    return m
+
+
 def _rotation_to_quaternion(R):
     trace = R[0, 0] + R[1, 1] + R[2, 2]
     if trace > 0:
@@ -280,6 +323,10 @@ class GraspNetNode(Node):
         self.declare_parameter('collision_thresh', 0.01)
         self.declare_parameter('voxel_size', 0.01)
         self.declare_parameter('top_k', 50)
+        self.declare_parameter('top_k_per_cluster', 3)
+        self.declare_parameter('nms_trans_thresh', 0.03)
+        self.declare_parameter('nms_rot_thresh_deg', 45.0)
+        self.declare_parameter('dbscan_eps', 0.08)
         self.declare_parameter('max_depth', 2.0)
         self.declare_parameter('remove_plane', True)
         self.declare_parameter('plane_dist_thresh', 0.01)
@@ -290,6 +337,14 @@ class GraspNetNode(Node):
         self.declare_parameter('det_score_thresh', 0.5)
         self.declare_parameter('det_class_filter', '')   # comma-separated; empty = all classes
         self.declare_parameter('det_timeout_sec',  3.0)
+        # camera topic parameters
+        self.declare_parameter('rgb_topic',   '/camera_1/image')
+        self.declare_parameter('depth_topic', '/camera_1/depth')
+        self.declare_parameter('info_topic',  '/camera_1/info')
+        # workspace mask
+        self.declare_parameter('workspace_mask_path', '')
+        # debug
+        self.declare_parameter('debug_pointcloud', False)
 
         ckpt   = self.get_parameter('checkpoint_path').value
         n_view = self.get_parameter('num_view').value
@@ -306,6 +361,16 @@ class GraspNetNode(Node):
         net.eval()
         self.net = net
 
+        # ---- workspace mask ----
+        mask_path = self.get_parameter('workspace_mask_path').value
+        if mask_path:
+            from PIL import Image as PILImage
+            self._workspace_mask = np.array(PILImage.open(mask_path).convert('L'), dtype=bool)
+            self.get_logger().info(
+                f'Loaded workspace mask: {mask_path}  shape={self._workspace_mask.shape}')
+        else:
+            self._workspace_mask = None
+
         # ---- cached camera frames ----
         self._latest_rgb   = None
         self._latest_depth = None
@@ -317,9 +382,12 @@ class GraspNetNode(Node):
 
         # ---- synchronized camera subscriptions ----
         qos = rclpy.qos.QoSProfile(depth=10)
-        sub_rgb   = message_filters.Subscriber(self, Image,      '/camera_2/image', qos_profile=qos)
-        sub_depth = message_filters.Subscriber(self, Image,      '/camera_2/depth', qos_profile=qos)
-        sub_info  = message_filters.Subscriber(self, CameraInfo, '/camera_2/info',  qos_profile=qos)
+        rgb_topic   = self.get_parameter('rgb_topic').value
+        depth_topic = self.get_parameter('depth_topic').value
+        info_topic  = self.get_parameter('info_topic').value
+        sub_rgb   = message_filters.Subscriber(self, Image,      rgb_topic,   qos_profile=qos)
+        sub_depth = message_filters.Subscriber(self, Image,      depth_topic, qos_profile=qos)
+        sub_info  = message_filters.Subscriber(self, CameraInfo, info_topic,  qos_profile=qos)
         self.sync = message_filters.ApproximateTimeSynchronizer(
             [sub_rgb, sub_depth, sub_info], queue_size=10, slop=0.1)
         self.sync.registerCallback(self._cache_frame)
@@ -338,6 +406,17 @@ class GraspNetNode(Node):
         self.pub_markers = self.create_publisher(MarkerArray, '/graspnet/markers',       10)
         self.pub_cloud   = self.create_publisher(PointCloud2, '/graspnet/pointcloud',    10)
 
+        # ---- debug DBSCAN cluster markers ----
+        self._pub_dbg_dbscan = self.create_publisher(
+            MarkerArray, '/graspnet/debug/dbscan_clusters', 1)
+
+        # ---- debug point cloud publishers (active when debug_pointcloud=true) ----
+        _dbg_steps = ['s1_depth_valid', 's2_workspace', 's3_plane_inliers', 's4_objects', 's5_sampled']
+        self._pub_dbg = {
+            s: self.create_publisher(PointCloud2, f'/graspnet/debug/{s}', 1)
+            for s in _dbg_steps
+        }
+
         # ---- trigger service ----
         self.srv = self.create_service(Trigger, '/graspnet/trigger', self._trigger_cb)
 
@@ -346,6 +425,9 @@ class GraspNetNode(Node):
         self.get_logger().info(
             f'Detection topics: {initial_topics}  '
             '(update at runtime: ros2 param set /graspnet_node det_topics "[...]")')
+        self.get_logger().info(
+            'Debug point clouds: set debug_pointcloud:=true to publish intermediate clouds on '
+            '/graspnet/debug/{s1_depth_valid,s2_workspace,s3_plane_inliers,s4_objects,s5_sampled}')
 
     # ------------------------------------------------------------------
     def _add_det_subscription(self, topic: str):
@@ -387,27 +469,26 @@ class GraspNetNode(Node):
         self._det_caches[topic] = (msg, self.get_clock().now())
 
     # ------------------------------------------------------------------
-    def _get_active_roi(self, img_H: int, img_W: int):
-        """Merge all non-expired detection caches into a single ROI mask.
+    def _get_active_bboxes(self, img_H: int, img_W: int):
+        """Collect non-expired detection bboxes scaled to depth image resolution.
 
-        Returns (active_caches, roi_mask) where:
+        Returns (active_caches, bboxes) where:
           active_caches: dict[topic, Detection2DArray] — only fresh entries
-          roi_mask:      bool HxW array, or None if no valid detections
+          bboxes:        list of (x1, y1, x2, y2) in depth image pixel coordinates
         """
-        timeout       = self.get_parameter('det_timeout_sec').value
-        det_w         = self.get_parameter('det_input_width').value
-        det_h         = self.get_parameter('det_input_height').value
-        score_thresh  = self.get_parameter('det_score_thresh').value
+        timeout          = self.get_parameter('det_timeout_sec').value
+        det_w            = self.get_parameter('det_input_width').value
+        det_h            = self.get_parameter('det_input_height').value
+        score_thresh     = self.get_parameter('det_score_thresh').value
         class_filter_str = self.get_parameter('det_class_filter').value
-        class_filter  = (set(c.strip() for c in class_filter_str.split(',') if c.strip())
-                         if class_filter_str else set())
+        class_filter     = (set(c.strip() for c in class_filter_str.split(',') if c.strip())
+                            if class_filter_str else set())
 
         scale_x = img_W / det_w if det_w > 0 else 1.0
         scale_y = img_H / det_h if det_h > 0 else 1.0
 
-        roi_mask      = np.zeros((img_H, img_W), dtype=bool)
         active_caches = {}
-        n_boxes       = 0
+        bboxes        = []
 
         for topic, (det_msg, stamp) in self._det_caches.items():
             age = (self.get_clock().now() - stamp).nanoseconds / 1e9
@@ -426,34 +507,46 @@ class GraspNetNode(Node):
                 if class_filter and best.hypothesis.class_id not in class_filter:
                     continue
 
-                cx = det.bbox.center.position.x * scale_x
-                cy = det.bbox.center.position.y * scale_y
-                sw = det.bbox.size_x * scale_x
-                sh = det.bbox.size_y * scale_y
+                dcx = det.bbox.center.position.x * scale_x
+                dcy = det.bbox.center.position.y * scale_y
+                sw  = det.bbox.size_x * scale_x
+                sh  = det.bbox.size_y * scale_y
 
-                x1 = int(np.clip(cx - sw / 2, 0, img_W - 1))
-                y1 = int(np.clip(cy - sh / 2, 0, img_H - 1))
-                x2 = int(np.clip(cx + sw / 2, 0, img_W))
-                y2 = int(np.clip(cy + sh / 2, 0, img_H))
+                x1 = int(np.clip(dcx - sw / 2, 0, img_W - 1))
+                y1 = int(np.clip(dcy - sh / 2, 0, img_H - 1))
+                x2 = int(np.clip(dcx + sw / 2, 0, img_W))
+                y2 = int(np.clip(dcy + sh / 2, 0, img_H))
 
                 if x2 > x1 and y2 > y1:
-                    roi_mask[y1:y2, x1:x2] = True
+                    bboxes.append((x1, y1, x2, y2))
                     accepted += 1
 
             if accepted > 0:
                 active_caches[topic] = det_msg
-                n_boxes += accepted
 
-        if n_boxes == 0:
-            if self._det_caches:
-                self.get_logger().warn(
-                    'Detection caches present but no bbox passed score/class filter.')
-            return {}, None
+        if bboxes:
+            self.get_logger().info(
+                f'Detections: {len(bboxes)} bbox(es) from {len(active_caches)} topic(s).')
+        elif self._det_caches:
+            self.get_logger().warn(
+                'Detection caches present but no bbox passed score/class filter.')
 
-        self.get_logger().info(
-            f'ROI: {n_boxes} bbox(es) from {len(active_caches)} topic(s) → '
-            f'{int(roi_mask.sum())} pixels.')
-        return active_caches, roi_mask
+        return active_caches, bboxes
+
+    def _filter_grasps_by_detections(self, translations, bboxes, fx, fy, cx, cy):
+        """Return bool mask: True if grasp 3D position projects into any detection bbox."""
+        keep = np.zeros(len(translations), dtype=bool)
+        for i, t in enumerate(translations):
+            tx, ty, tz = float(t[0]), float(t[1]), float(t[2])
+            if tz <= 1e-4:
+                continue
+            u = fx * tx / tz + cx
+            v = fy * ty / tz + cy
+            for (x1, y1, x2, y2) in bboxes:
+                if x1 <= u <= x2 and y1 <= v <= y2:
+                    keep[i] = True
+                    break
+        return keep
 
     # ------------------------------------------------------------------
     def _draw_detection_boxes(self, vis_img: np.ndarray,
@@ -541,13 +634,33 @@ class GraspNetNode(Node):
         cam = GraspCameraInfo(float(W), float(H), fx, fy, cx, cy, factor_depth)
         cloud_org = create_point_cloud_from_depth_image(depth_raw, cam, organized=True)
 
-        max_depth = self.get_parameter('max_depth').value
-        mask = (depth_raw > 0) & (depth_raw < max_depth)
+        debug = self.get_parameter('debug_pointcloud').value
 
-        # Apply detection ROI if any active topic cache is available
-        active_caches, roi_mask = self._get_active_roi(H, W)
-        if roi_mask is not None:
-            mask = mask & roi_mask
+        max_depth = self.get_parameter('max_depth').value
+        depth_mask = (depth_raw > 0) & (depth_raw < max_depth)
+        mask = depth_mask.copy()
+
+        if debug:
+            _d = cloud_org[depth_mask]
+            _c = (color_rgb / 255.0)[depth_mask]
+            self._pub_dbg['s1_depth_valid'].publish(_build_pointcloud2(_d, _c, rgb_msg.header))
+
+        # Apply workspace mask if loaded
+        if self._workspace_mask is not None:
+            ws = self._workspace_mask
+            if ws.shape != (H, W):
+                import cv2 as _cv2
+                ws = _cv2.resize(ws.astype(np.uint8), (W, H),
+                                 interpolation=_cv2.INTER_NEAREST).astype(bool)
+            mask = mask & ws
+
+        if debug:
+            _d = cloud_org[mask]
+            _c = (color_rgb / 255.0)[mask]
+            self._pub_dbg['s2_workspace'].publish(_build_pointcloud2(_d, _c, rgb_msg.header))
+
+        # Collect active detection bboxes for post-inference grasp filtering
+        active_caches, det_bboxes = self._get_active_bboxes(H, W)
 
         cloud_masked = cloud_org[mask]
         color_masked = (color_rgb / 255.0)[mask]
@@ -565,12 +678,24 @@ class GraspNetNode(Node):
                                            ransac_n=3, num_iterations=100)
             keep = np.ones(len(cloud_masked), dtype=bool)
             keep[inliers] = False
+            if debug:
+                _plane_xyz = cloud_masked[~keep]
+                _plane_rgb = np.zeros((len(_plane_xyz), 3), dtype=np.float32)
+                _plane_rgb[:, 0] = 1.0  # red = plane inliers
+                self._pub_dbg['s3_plane_inliers'].publish(
+                    _build_pointcloud2(_plane_xyz, _plane_rgb, rgb_msg.header))
             cloud_masked = cloud_masked[keep]
             color_masked = color_masked[keep]
             self.get_logger().info(
                 f'After plane removal: {keep.sum()} points (removed {len(inliers)} plane inliers)')
             if len(cloud_masked) < 100:
                 return 'Too few points after plane removal — skipping frame.'
+            if debug:
+                self._pub_dbg['s4_objects'].publish(
+                    _build_pointcloud2(cloud_masked, color_masked, rgb_msg.header))
+        elif debug:
+            self._pub_dbg['s4_objects'].publish(
+                _build_pointcloud2(cloud_masked, color_masked, rgb_msg.header))
 
         self.pub_cloud.publish(_build_pointcloud2(cloud_masked, color_masked, rgb_msg.header))
 
@@ -583,6 +708,9 @@ class GraspNetNode(Node):
                 np.random.choice(len(cloud_masked), num_point - len(cloud_masked), replace=True),
             ])
         cloud_sampled = cloud_masked[idxs].astype(np.float32)
+        if debug:
+            self._pub_dbg['s5_sampled'].publish(
+                _build_pointcloud2(cloud_sampled, color_masked[idxs], rgb_msg.header))
 
         end_points = {
             'point_clouds': torch.from_numpy(cloud_sampled[np.newaxis]).to(self.device)
@@ -608,9 +736,9 @@ class GraspNetNode(Node):
             collision_mask = detector.detect(gg, approach_dist=0.05, collision_thresh=collision_thresh)
             gg = gg[~collision_mask]
 
-        gg = gg.nms().sort_by_score()
-        top_k = self.get_parameter('top_k').value
-        gg = gg[:top_k]
+        nms_t = self.get_parameter('nms_trans_thresh').value
+        nms_r = self.get_parameter('nms_rot_thresh_deg').value / 180.0 * np.pi
+        gg = gg.nms(translation_thresh=nms_t, rotation_thresh=nms_r).sort_by_score()
 
         from sklearn.cluster import DBSCAN
         translations  = gg.translations
@@ -619,22 +747,87 @@ class GraspNetNode(Node):
         widths        = gg.widths
         depths        = gg.depths
 
+        top_k      = self.get_parameter('top_k').value
+        dbscan_eps = self.get_parameter('dbscan_eps').value
+        n_clusters = 0
         if len(translations) > 0:
-            labels = DBSCAN(eps=0.08, min_samples=1).fit_predict(translations)
-            best_idxs = []
-            for lbl in np.unique(labels):
-                cluster_idxs = np.where(labels == lbl)[0]
-                best = cluster_idxs[np.argmax(scores[cluster_idxs])]
-                best_idxs.append(best)
-            best_idxs = np.array(best_idxs)
-            translations = translations[best_idxs]
-            rotations    = rotations[best_idxs]
-            scores       = scores[best_idxs]
-            widths       = widths[best_idxs]
-            depths       = depths[best_idxs]
+            if dbscan_eps > 0:
+                # DBSCAN first so every object cluster gets fair representation,
+                # then cap per cluster; top_k is a final safety limit on total output.
+                top_k_per_cluster = self.get_parameter('top_k_per_cluster').value
+                labels = DBSCAN(eps=dbscan_eps, min_samples=1).fit_predict(translations)
+                unique_labels = np.unique(labels)
+                n_clusters = len(unique_labels)
+
+                # Per-cluster log summary
+                self.get_logger().info(
+                    f'DBSCAN eps={dbscan_eps}m → {n_clusters} clusters '
+                    f'(top_k_per_cluster={top_k_per_cluster}):')
+                for lbl in unique_labels:
+                    c_idxs = np.where(labels == lbl)[0]
+                    c_scores = scores[c_idxs]
+                    centroid = translations[c_idxs].mean(axis=0)
+                    self.get_logger().info(
+                        f'  cluster[{lbl}] n={len(c_idxs)} '
+                        f'score={c_scores.max():.3f}~{c_scores.min():.3f} '
+                        f'centroid=({centroid[0]:.3f},{centroid[1]:.3f},{centroid[2]:.3f})')
+
+                # Debug: publish all grasps coloured by cluster (before top_k selection)
+                if debug:
+                    _ma = MarkerArray()
+                    _del = Marker()
+                    _del.header = rgb_msg.header
+                    _del.ns = 'dbscan_debug'
+                    _del.action = Marker.DELETEALL
+                    _ma.markers.append(_del)
+                    for _i, _lbl in enumerate(labels):
+                        _r, _g, _b = _cluster_color_rgb(int(_lbl), n_clusters)
+                        _ma.markers.append(_make_gripper_marker_rgb(
+                            _i, 'dbscan_debug',
+                            rotations[_i], translations[_i],
+                            widths[_i], depths[_i],
+                            _r, _g, _b, 1.0, rgb_msg.header))
+                    self._pub_dbg_dbscan.publish(_ma)
+
+                keep_idxs = []
+                for lbl in unique_labels:
+                    cluster_idxs = np.where(labels == lbl)[0]
+                    sorted_idxs = cluster_idxs[np.argsort(scores[cluster_idxs])[::-1]]
+                    keep_idxs.extend(sorted_idxs[:top_k_per_cluster].tolist())
+                keep_idxs = np.array(keep_idxs)
+                keep_idxs = keep_idxs[np.argsort(scores[keep_idxs])[::-1]][:top_k]
+            else:
+                # DBSCAN disabled — take top_k by score; top_k_per_cluster is ignored
+                keep_idxs = np.arange(min(top_k, len(translations)))
+                n_clusters = 0
+                self.get_logger().info('DBSCAN disabled (dbscan_eps=-1); top_k_per_cluster ignored.')
+            translations = translations[keep_idxs]
+            rotations    = rotations[keep_idxs]
+            scores       = scores[keep_idxs]
+            widths       = widths[keep_idxs]
+            depths       = depths[keep_idxs]
+
+        # Filter grasps to only those projecting onto a detected object bbox
+        if det_bboxes and len(translations) > 0:
+            on_obj = self._filter_grasps_by_detections(translations, det_bboxes, fx, fy, cx, cy)
+            n_before = len(translations)
+            translations = translations[on_obj]
+            rotations    = rotations[on_obj]
+            scores       = scores[on_obj]
+            widths       = widths[on_obj]
+            depths       = depths[on_obj]
+            self.get_logger().info(
+                f'Detection filter: kept {on_obj.sum()}/{n_before} grasps on detected objects.')
 
         n_grasps = len(translations)
-        self.get_logger().info(f'Found {n_grasps} grasps (1 per object cluster).')
+        self.get_logger().info(f'Found {n_grasps} grasps across {n_clusters} object clusters.')
+        for _i in range(n_grasps):
+            _app = rotations[_i][:, 0]   # approach direction in camera frame
+            self.get_logger().info(
+                f'  grasp[{_i}] score={scores[_i]:.3f} '
+                f'pos=({translations[_i][0]:.3f},{translations[_i][1]:.3f},{translations[_i][2]:.3f}) '
+                f'approach=({_app[0]:.2f},{_app[1]:.2f},{_app[2]:.2f}) '
+                f'width={widths[_i]:.3f} depth={depths[_i]:.3f}')
         score_max = float(scores.max()) if n_grasps > 0 else 1.0
 
         # Visualization: detection boxes first, then grasp overlays on top
@@ -653,7 +846,7 @@ class GraspNetNode(Node):
         ma = MarkerArray()
         del_marker = Marker()
         del_marker.header = rgb_msg.header
-        del_marker.ns = 'graspnet'
+        del_marker.ns = ''
         del_marker.action = Marker.DELETEALL
         ma.markers.append(del_marker)
         for i in range(n_grasps):

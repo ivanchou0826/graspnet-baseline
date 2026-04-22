@@ -30,7 +30,17 @@ parser.add_argument('--num_point', type=int, default=20000, help='Point Number [
 parser.add_argument('--num_view', type=int, default=300, help='View Number [default: 300]')
 parser.add_argument('--collision_thresh', type=float, default=0.01, help='Collision Threshold in collision detection [default: 0.01]')
 parser.add_argument('--voxel_size', type=float, default=0.01, help='Voxel Size to process point clouds before collision detection [default: 0.01]')
+parser.add_argument('--debug_dir', default='', help='If set, save intermediate PLY files (s1/s2/s5) to this directory for inspection in Foxglove/CloudCompare/Open3D')
 cfgs = parser.parse_args()
+
+
+def _save_ply(path, xyz, rgb_float):
+    """Save Nx3 xyz + Nx3 rgb [0,1] as a colored PLY via Open3D."""
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz.astype(np.float32))
+    pcd.colors = o3d.utility.Vector3dVector(np.clip(rgb_float, 0, 1).astype(np.float32))
+    o3d.io.write_point_cloud(path, pcd)
+    print(f'  [debug] {os.path.basename(path)}  {len(xyz)} pts')
 
 
 def get_net():
@@ -48,7 +58,7 @@ def get_net():
     net.eval()
     return net
 
-def get_and_process_data(data_dir):
+def get_and_process_data(data_dir, debug_dir=''):
     # load data
     color = np.array(Image.open(os.path.join(data_dir, 'color.png')), dtype=np.float32) / 255.0
     depth = np.array(Image.open(os.path.join(data_dir, 'depth.png')))
@@ -61,10 +71,20 @@ def get_and_process_data(data_dir):
     camera = CameraInfo(1280.0, 720.0, intrinsic[0][0], intrinsic[1][1], intrinsic[0][2], intrinsic[1][2], factor_depth)
     cloud = create_point_cloud_from_depth_image(depth, camera, organized=True)
 
-    # get valid points
-    mask = (workspace_mask & (depth > 0))
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
+
+    # s1: depth-valid points only (before workspace mask)
+    depth_mask = depth > 0
+    if debug_dir:
+        _save_ply(os.path.join(debug_dir, 's1_depth_valid.ply'), cloud[depth_mask], color[depth_mask])
+
+    # s2: after workspace mask
+    mask = (workspace_mask.astype(bool) & depth_mask)
     cloud_masked = cloud[mask]
     color_masked = color[mask]
+    if debug_dir:
+        _save_ply(os.path.join(debug_dir, 's2_workspace.ply'), cloud_masked, color_masked)
 
     # sample points
     if len(cloud_masked) >= cfgs.num_point:
@@ -75,6 +95,10 @@ def get_and_process_data(data_dir):
         idxs = np.concatenate([idxs1, idxs2], axis=0)
     cloud_sampled = cloud_masked[idxs]
     color_sampled = color_masked[idxs]
+
+    # s5: sampled input to model (s3/s4 = plane removal, not used in demo)
+    if debug_dir:
+        _save_ply(os.path.join(debug_dir, 's5_sampled.ply'), cloud_sampled, color_sampled)
 
     # convert data
     cloud = o3d.geometry.PointCloud()
@@ -113,7 +137,7 @@ def vis_grasps(gg, cloud):
 
 def demo(data_dir):
     net = get_net()
-    end_points, cloud = get_and_process_data(data_dir)
+    end_points, cloud = get_and_process_data(data_dir, debug_dir=cfgs.debug_dir)
     gg = get_grasps(net, end_points)
     if cfgs.collision_thresh > 0:
         gg = collision_detection(gg, np.array(cloud.points))
