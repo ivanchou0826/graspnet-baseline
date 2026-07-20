@@ -47,7 +47,7 @@ _ARGS = [
      '[Model] Collision detection threshold in metres; -1.0 to disable (faster inference)'),
 
     # ── Point cloud pre-processing ─────────────────────────────────────────
-    ('max_depth',           '2.0',
+    ('max_depth',           '3.0',
      '[PointCloud] Depth cutoff in metres — points farther than this are discarded'),
     ('remove_plane',        'false',
      '[PointCloud] RANSAC plane removal to strip the table surface before inference'),
@@ -67,7 +67,7 @@ _ARGS = [
      '[Grasp/DBSCAN] Cluster radius in metres; grasps within this distance are grouped as one object; -1.0 to disable'),
 
     # ── Workspace mask ────────────────────────────────────────────────────
-    ('workspace_mask_path', '/workspaces/isaac_ros-dev/src/graspNet/graspnet-baseline/mask.png',
+    ('workspace_mask_path', '',
      '[Mask] Path to a binary PNG workspace mask; white pixels = keep, black = discard; empty = disabled'),
 
     # ── Debug ─────────────────────────────────────────────────────────────

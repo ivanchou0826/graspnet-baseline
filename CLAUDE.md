@@ -19,9 +19,15 @@ cd knn && python setup.py install && cd ..
 
 # Install graspnetAPI for evaluation
 pip install graspnetAPI
+# If sklearn deprecation error: SKLEARN_ALLOW_DEPRECATED_SKLEARN_PACKAGE_INSTALL=True pip install graspnetAPI
+# If permission errors on egg-info/build: sudo rm -rf graspnetAPI.egg-info build/ && pip install .
 ```
 
-Pretrained weights: `checkpoint-rs.tar` (RealSense) and `checkpoint-kn.tar` (Kinect). The realsense model transfers better to new scenes.
+`nvcc` must match PyTorch's CUDA version: `nvcc --version` and `python3 -c "import torch; print(torch.version.cuda)"`.
+
+A Python venv lives at `venv/` in the repo root — activate it before running standalone scripts outside ROS2.
+
+Pretrained weights: `checkpoint-rs.tar` (RealSense) and `checkpoint-kn.tar` (Kinect). The RealSense model transfers better to new scenes.
 
 ## Common Commands
 
@@ -65,7 +71,8 @@ export GRASPNET_ROOT=/path/to/graspnet-baseline
 ros2 launch graspnet_ros2 graspnet.launch.py
 ```
 
-The launch file auto-sets `GRASPNET_ROOT` to the repo root if not already set. To override the checkpoint or any parameter, pass arguments on the command line or edit `graspnet_ros2/launch/graspnet.launch.py`.
+The launch file auto-sets `GRASPNET_ROOT` to the repo root if not already set.  
+See all launch arguments: `ros2 launch graspnet_ros2 graspnet.launch.py --show-args`
 
 **Trigger inference on demand:**
 ```bash
@@ -77,23 +84,31 @@ Inference only runs when the service is called — the node continuously caches 
 **Topics:**
 | Topic | Direction | Type | Description |
 |---|---|---|---|
-| `/camera_2/image` | sub | `sensor_msgs/Image` | RGB input |
-| `/camera_2/depth` | sub | `sensor_msgs/Image` | Depth input (16UC1 or 32FC1) |
-| `/camera_2/info` | sub | `sensor_msgs/CameraInfo` | Camera intrinsics |
+| (configurable, default `/camera_1/image`) | sub | `sensor_msgs/Image` | RGB input |
+| (configurable, default `/camera_1/depth`) | sub | `sensor_msgs/Image` | Depth input (16UC1 or 32FC1) |
+| (configurable, default `/camera_1/info`) | sub | `sensor_msgs/CameraInfo` | Camera intrinsics |
 | (configurable) | sub (optional) | `vision_msgs/Detection2DArray` | One or more detection topics from YOLOv8/RT-DETR; set via `det_topics` parameter |
-| `/graspnet/visualization` | pub | `sensor_msgs/Image` | BGR image with detection boxes (yellow) and grasp overlays |
+| `/graspnet/visualization` | pub | `sensor_msgs/Image` | BGR image with detection boxes and grasp overlays (score-based color gradient: red=low → green=high) |
 | `/graspnet/best_grasp` | pub | `geometry_msgs/PoseStamped` | Highest-score grasp pose (camera frame) |
 | `/graspnet/markers` | pub | `visualization_msgs/MarkerArray` | 3D gripper LINE_LIST markers for rviz2 |
 | `/graspnet/pointcloud` | pub | `sensor_msgs/PointCloud2` | XYZRGB cloud after plane removal |
+| `/graspnet/debug/*` | pub | `sensor_msgs/PointCloud2` | Intermediate clouds (only when `debug_pointcloud=true`) |
 
 **Node parameters** (all settable from launch file):
+- `rgb_topic` / `depth_topic` / `info_topic` — camera topic names (default: `/camera_1/image`, `/camera_1/depth`, `/camera_1/info`)
 - `checkpoint_path` — path to `.tar` checkpoint
 - `num_point` (20000) — points sampled for inference
 - `collision_thresh` (0.01) — set to -1 to skip collision filtering
-- `top_k` (50) — maximum grasps before DBSCAN clustering
 - `max_depth` (2.0 m) — depth cutoff for point cloud masking
-- `remove_plane` (true) — RANSAC plane removal to strip the table
+- `remove_plane` (false) — RANSAC plane removal to strip the table
 - `plane_dist_thresh` (0.01 m) — RANSAC inlier threshold
+- `top_k` (100) — maximum grasps kept after DBSCAN + per-cluster selection
+- `top_k_per_cluster` (3) — max grasps per DBSCAN cluster (= per object)
+- `nms_trans_thresh` (0.03 m) — translation threshold for NMS deduplication
+- `nms_rot_thresh_deg` (45.0°) — rotation threshold for NMS deduplication
+- `dbscan_eps` (0.05 m) — DBSCAN cluster radius; -1.0 to disable clustering
+- `workspace_mask_path` ("") — path to binary PNG mask (white=keep, black=discard); empty = disabled
+- `debug_pointcloud` (false) — publish intermediate point clouds on `/graspnet/debug/*`
 - `det_topics` (`['/detections_output']`) — string array of detection topic names; add/remove at runtime via `ros2 param set`
 - `det_input_width` / `det_input_height` (0) — detector model input resolution; 0 = same as depth image (no scaling)
 - `det_score_thresh` (0.5) — ignore detections below this confidence
@@ -101,16 +116,19 @@ Inference only runs when the service is called — the node continuously caches 
 - `det_timeout_sec` (3.0) — ignore cached detections older than this (seconds)
 
 **Detection ROI flow:**
-Each topic in `det_topics` gets its own subscription and cache. At trigger time all non-expired caches are merged: each `Detection2D.bbox` (in detector pixel space) is scaled to depth image resolution (`scale = depth_size / det_input_size`) and unioned into a single binary ROI mask, which is ANDed with the depth validity mask before point cloud extraction. Multiple instances of the same object (multiple bboxes in one topic) and multiple object classes (multiple topics) are both handled this way. Downstream DBSCAN clustering then groups spatially close grasps into one best grasp per object. Each topic's bboxes are drawn in a distinct color on `/graspnet/visualization`.
+Each topic in `det_topics` gets its own subscription and cache. At trigger time all non-expired caches are merged: each `Detection2D.bbox` (in detector pixel space) is scaled to depth image resolution (`scale = depth_size / det_input_size`) and unioned into a single binary ROI mask, which is ANDed with the depth validity mask before point cloud extraction. Multiple instances of the same object (multiple bboxes in one topic) and multiple object classes (multiple topics) are both handled this way. Downstream DBSCAN clustering then groups spatially close grasps into one best grasp per object. Each topic's bboxes are drawn in a distinct color on `/graspnet/visualization` (alphabetically sorted: topic 1=yellow, 2=blue, 3=green, 4=orange, …).
 
 **Changing detection topics at runtime (no restart needed):**
 ```bash
-# Subscribe to three object-specific topics
 ros2 param set /graspnet_node det_topics \
   "['/detections/blue_cube', '/detections/green_cube', '/detections/red_cube']"
+```
 
-# Revert to default single topic
-ros2 param set /graspnet_node det_topics "['/detections_output']"
+**Workspace mask creation tool** (interactive, requires a live camera topic):
+```bash
+# Run from the graspnet_ros2/scripts/ directory
+python make_workspace_mask.py --topic /camera_1/image --output workspace_mask.png
+# Left-click twice to define rectangle corners; Enter to save; q to quit
 ```
 
 ## Architecture
@@ -132,15 +150,15 @@ RGB-D image
   → GraspNetStage2: CloudCrop → OperationNet/ToleranceNet → grasp grid
   → pred_decode() → GraspGroup
   → ModelFreeCollisionDetector (optional)
-  → nms() + sort_by_score() → top-K grasps
+  → NMS (trans+rot thresholds) + sort_by_score() → top-K grasps
 ```
 
 ### ROS2 Node Post-Processing
 
 After model inference, the node applies:
 1. Collision filtering (`ModelFreeCollisionDetector` against the masked point cloud)
-2. NMS + score sort → top-K
-3. DBSCAN clustering (`eps=0.08 m`) to reduce to one best grasp per object
+2. NMS (`nms_trans_thresh`, `nms_rot_thresh_deg`) + score sort → top-K
+3. DBSCAN clustering (`dbscan_eps=0.05 m`) to reduce to `top_k_per_cluster` best grasps per object
 
 ### Key Files
 - `models/graspnet.py` — full network, `pred_decode()`
@@ -153,6 +171,8 @@ After model inference, the node applies:
 - `utils/loss_utils.py` — grasp parameter constants (`num_view=300`, `num_angle=12`, `num_depth=4`)
 - `graspnet_ros2/graspnet_ros2/graspnet_node.py` — ROS2 node (GraspNetNode)
 - `graspnet_ros2/launch/graspnet.launch.py` — launch file with parameter defaults
+- `graspnet_ros2/scripts/make_workspace_mask.py` — interactive rectangular mask creator
+- `graspnet_node.py` (repo root) — older standalone ROS2 node, superseded by `graspnet_ros2/`
 
 ### Dataset Splits
 - Train: scenes 0–99
