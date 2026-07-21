@@ -31,6 +31,12 @@ parser.add_argument('--num_view', type=int, default=300, help='View Number [defa
 parser.add_argument('--collision_thresh', type=float, default=0.01, help='Collision Threshold in collision detection [default: 0.01]')
 parser.add_argument('--voxel_size', type=float, default=0.01, help='Voxel Size to process point clouds before collision detection [default: 0.01]')
 parser.add_argument('--debug_dir', default='', help='If set, save intermediate PLY files (s1/s2/s5) to this directory for inspection in Foxglove/CloudCompare/Open3D')
+# ROS2 single-frame mode
+parser.add_argument('--from_ros', action='store_true', help='Capture one synchronized frame from ROS2 topics instead of reading files')
+parser.add_argument('--rgb_topic',   default='/rgb/camera_3',              help='ROS2 RGB image topic')
+parser.add_argument('--depth_topic', default='/camera_3/depth/image_raw',  help='ROS2 depth image topic')
+parser.add_argument('--info_topic',  default='/camera_3/depth/camera_info', help='ROS2 CameraInfo topic')
+parser.add_argument('--max_depth',   type=float, default=3.0, help='Depth cutoff in metres for ROS2 mode [default: 3.0]')
 cfgs = parser.parse_args()
 
 
@@ -113,6 +119,101 @@ def get_and_process_data(data_dir, debug_dir=''):
 
     return end_points, cloud
 
+def get_and_process_data_from_ros(rgb_topic, depth_topic, info_topic):
+    """Capture one synchronized frame from ROS2 and return same format as get_and_process_data()."""
+    import rclpy
+    import rclpy.node
+    import message_filters
+    from rclpy.node import Node as RclpyNode
+    from sensor_msgs.msg import Image as RosImage, CameraInfo as RosCameraInfo
+
+    captured = {}
+
+    class _OneShot(RclpyNode):
+        def __init__(self):
+            super().__init__('_graspnet_snap')
+            rgb_sub = message_filters.Subscriber(self, RosImage, rgb_topic)
+            dep_sub = message_filters.Subscriber(self, RosImage, depth_topic)
+            inf_sub = message_filters.Subscriber(self, RosCameraInfo, info_topic)
+            self._sync = message_filters.ApproximateTimeSynchronizer(
+                [rgb_sub, dep_sub, inf_sub], queue_size=5, slop=0.1)
+            self._sync.registerCallback(self._cb)
+            self._done = False
+
+        def _cb(self, rgb_msg, depth_msg, info_msg):
+            captured['rgb']   = rgb_msg
+            captured['depth'] = depth_msg
+            captured['info']  = info_msg
+            self._done = True
+
+    rclpy.init()
+    node = _OneShot()
+    print(f'Waiting for frame on topics:\n  rgb:   {rgb_topic}\n  depth: {depth_topic}\n  info:  {info_topic}')
+    while not node._done:
+        rclpy.spin_once(node, timeout_sec=0.1)
+    node.destroy_node()
+    rclpy.shutdown()
+
+    rgb_msg   = captured['rgb']
+    depth_msg = captured['depth']
+    info_msg  = captured['info']
+
+    # decode RGB → float32 H×W×3 [0,1]
+    enc = rgb_msg.encoding.lower()
+    color_u8 = np.frombuffer(rgb_msg.data, dtype=np.uint8).reshape(rgb_msg.height, rgb_msg.width, -1)[:, :, :3]
+    if 'bgr' in enc:
+        color_u8 = color_u8[:, :, ::-1].copy()
+    color = color_u8.astype(np.float32) / 255.0
+
+    # decode depth
+    enc_d = depth_msg.encoding.lower()
+    if '16' in enc_d:
+        depth = np.frombuffer(depth_msg.data, dtype=np.uint16).reshape(depth_msg.height, depth_msg.width)
+        factor_depth = 1000.0
+    else:
+        depth = np.frombuffer(depth_msg.data, dtype=np.float32).reshape(depth_msg.height, depth_msg.width)
+        factor_depth = 1.0
+
+    H, W = depth.shape
+    print(f'Frame captured: {W}x{H}  depth_enc={depth_msg.encoding}  factor={factor_depth}')
+
+    # resize color to match depth resolution if they differ
+    if color.shape[:2] != (H, W):
+        from PIL import Image as PilImage
+        color_pil = PilImage.fromarray((color * 255).astype(np.uint8))
+        color = np.array(color_pil.resize((W, H), PilImage.BILINEAR), dtype=np.float32) / 255.0
+
+    K = info_msg.k
+    fx, fy, cx, cy = K[0], K[4], K[2], K[5]
+    camera = CameraInfo(float(W), float(H), fx, fy, cx, cy, factor_depth)
+    cloud_org = create_point_cloud_from_depth_image(depth, camera, organized=True)
+
+    depth_mask = (depth > 0) & (depth < cfgs.max_depth * factor_depth)
+    cloud_masked = cloud_org[depth_mask]
+    color_masked = color[depth_mask]
+    print(f'Valid points: {len(cloud_masked)} / {H * W}')
+
+    if len(cloud_masked) >= cfgs.num_point:
+        idxs = np.random.choice(len(cloud_masked), cfgs.num_point, replace=False)
+    else:
+        idxs1 = np.arange(len(cloud_masked))
+        idxs2 = np.random.choice(len(cloud_masked), cfgs.num_point - len(cloud_masked), replace=True)
+        idxs = np.concatenate([idxs1, idxs2], axis=0)
+    cloud_sampled = cloud_masked[idxs]
+    color_sampled = color_masked[idxs]
+
+    cloud_o3d = o3d.geometry.PointCloud()
+    cloud_o3d.points = o3d.utility.Vector3dVector(cloud_masked.astype(np.float32))
+    cloud_o3d.colors = o3d.utility.Vector3dVector(color_masked.astype(np.float32))
+
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    end_points = {
+        'point_clouds': torch.from_numpy(cloud_sampled[np.newaxis].astype(np.float32)).to(device),
+        'cloud_colors': color_sampled,
+    }
+    return end_points, cloud_o3d
+
+
 def get_grasps(net, end_points):
     # Forward pass
     with torch.no_grad():
@@ -137,7 +238,11 @@ def vis_grasps(gg, cloud):
 
 def demo(data_dir):
     net = get_net()
-    end_points, cloud = get_and_process_data(data_dir, debug_dir=cfgs.debug_dir)
+    if cfgs.from_ros:
+        end_points, cloud = get_and_process_data_from_ros(
+            cfgs.rgb_topic, cfgs.depth_topic, cfgs.info_topic)
+    else:
+        end_points, cloud = get_and_process_data(data_dir, debug_dir=cfgs.debug_dir)
     gg = get_grasps(net, end_points)
     if cfgs.collision_thresh > 0:
         gg = collision_detection(gg, np.array(cloud.points))

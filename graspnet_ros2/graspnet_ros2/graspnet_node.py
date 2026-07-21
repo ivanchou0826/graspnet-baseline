@@ -116,10 +116,10 @@ def _project(pt3d, fx, fy, cx, cy):
 def _draw_grasp(img, R, t, width, depth, score, fx, fy, cx, cy, score_max=1.2):
     half_w = width / 2.0
     corners_local = np.array([
-        [depth,  -half_w, 0.0],
-        [depth,   half_w, 0.0],
-        [0.0,     half_w, 0.0],
-        [0.0,    -half_w, 0.0],
+        [0.0,    -half_w, 0.0],   # contact left  (at grasp center t)
+        [0.0,     half_w, 0.0],   # contact right
+        [-depth,  half_w, 0.0],   # palm right
+        [-depth, -half_w, 0.0],   # palm left
     ], dtype=np.float32)
 
     pixels = []
@@ -181,14 +181,14 @@ def _make_gripper_marker(marker_id, R, t, width, depth, score, score_max, header
     """Build a LINE_LIST Marker showing the gripper shape in 3D."""
     half_w = width / 2.0
     pts_local = np.array([
-        [0.0,     -half_w, 0.0],
-        [depth,   -half_w, 0.0],
-        [0.0,      half_w, 0.0],
-        [depth,    half_w, 0.0],
-        [0.0,     -half_w, 0.0],
-        [0.0,      half_w, 0.0],
-        [-0.04,    0.0,    0.0],
-        [0.0,      0.0,    0.0],
+        [-depth, -half_w, 0.0],       # left finger at palm
+        [0.0,    -half_w, 0.0],       # left finger contact (at grasp center t)
+        [-depth,  half_w, 0.0],       # right finger at palm
+        [0.0,     half_w, 0.0],       # right finger contact
+        [-depth, -half_w, 0.0],       # palm bar left
+        [-depth,  half_w, 0.0],       # palm bar right
+        [-depth - 0.04, 0.0, 0.0],   # approach arm start
+        [-depth,  0.0,   0.0],        # approach arm end (palm centre)
     ], dtype=np.float32)
 
     pairs = [(0, 1), (2, 3), (4, 5), (6, 7)]
@@ -253,14 +253,14 @@ def _make_gripper_marker_rgb(marker_id, ns, R, t, width, depth, r, g, b, alpha, 
     """LINE_LIST gripper marker with explicit RGBA color."""
     half_w = width / 2.0
     pts_local = np.array([
-        [0.0,    -half_w, 0.0],
-        [depth,  -half_w, 0.0],
-        [0.0,     half_w, 0.0],
-        [depth,   half_w, 0.0],
-        [0.0,    -half_w, 0.0],
-        [0.0,     half_w, 0.0],
-        [-0.04,   0.0,    0.0],
-        [0.0,     0.0,    0.0],
+        [-depth, -half_w, 0.0],       # left finger at palm
+        [0.0,    -half_w, 0.0],       # left finger contact (at grasp center t)
+        [-depth,  half_w, 0.0],       # right finger at palm
+        [0.0,     half_w, 0.0],       # right finger contact
+        [-depth, -half_w, 0.0],       # palm bar left
+        [-depth,  half_w, 0.0],       # palm bar right
+        [-depth - 0.04, 0.0, 0.0],   # approach arm start
+        [-depth,  0.0,   0.0],        # approach arm end (palm centre)
     ], dtype=np.float32)
     pairs = [(0, 1), (2, 3), (4, 5), (6, 7)]
 
@@ -637,7 +637,7 @@ class GraspNetNode(Node):
         debug = self.get_parameter('debug_pointcloud').value
 
         max_depth = self.get_parameter('max_depth').value
-        depth_mask = (depth_raw > 0) & (depth_raw < max_depth)
+        depth_mask = (depth_raw > 0) & (depth_raw < max_depth * factor_depth)
         mask = depth_mask.copy()
 
         if debug:

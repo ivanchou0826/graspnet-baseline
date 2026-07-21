@@ -52,6 +52,25 @@ CUDA_VISIBLE_DEVICES=0 python demo.py \
   --checkpoint_path checkpoint-rs.tar
 ```
 
+**Demo from live ROS2 topics (single-frame capture, Isaac Sim default topics):**
+```bash
+CUDA_VISIBLE_DEVICES=0 python demo.py \
+  --checkpoint_path checkpoint-rs.tar --from_ros
+# Defaults: --rgb_topic /rgb/camera_3  --depth_topic /camera_3/depth/image_raw
+#           --info_topic /camera_3/depth/camera_info  --max_depth 3.0
+# Captures one synchronized frame, runs inference, opens Open3D viewer.
+```
+
+**Standalone ROS2 validation node** (`demo_ros2.py`, no colcon build needed):
+```bash
+python3 demo_ros2.py --checkpoint_path checkpoint-rs.tar \
+  --rgb_topic /rgb/camera_3 \
+  --depth_topic /camera_3/depth/image_raw \
+  --info_topic /camera_3/depth/camera_info
+# Trigger: ros2 service call /graspnet_demo/trigger std_srvs/srv/Trigger {}
+# Publishes: /graspnet_demo/markers (MarkerArray), /graspnet_demo/pointcloud
+```
+
 **Generate tolerance labels** (not included in dataset download):
 ```bash
 cd dataset && bash command_generate_tolerance_label.sh
@@ -160,6 +179,35 @@ After model inference, the node applies:
 2. NMS (`nms_trans_thresh`, `nms_rot_thresh_deg`) + score sort → top-K
 3. DBSCAN clustering (`dbscan_eps=0.05 m`) to reduce to `top_k_per_cluster` best grasps per object
 
+### Grasp Output Interpretation
+
+Each grasp in `GraspGroup` is a 17-element array: `[score, width, height, depth, R(9), t(3), object_id]`.
+
+**Coordinate frame:** all values are in the **camera optical frame** (origin = camera lens centre; +X right, +Y down, +Z into scene).
+
+| Field | Meaning |
+|---|---|
+| `t` (translation, 3) | Midpoint between the two finger contacts — a seed point ON the object surface |
+| `R` (rotation, 3×3) | Gripper orientation; `R[:,0]` = approach direction (pointing toward object from outside) |
+| `width` | Finger opening distance; **hard-capped at 0.1 m** (`GRASP_MAX_WIDTH` in `loss_utils.py`) — objects wider than 10 cm will always output 0.1 |
+| `depth` | Finger length (0.01–0.04 m); palm centre is at `t + R[:,0] * (−depth)` |
+| `score` | Grasp quality [0, 1] |
+
+**Gripper geometry in local frame** (origin = `t` = contact centre):
+```
+approach →
+[arm]──[palm]──[left finger ]──► t   (left contact at [0, -half_w, 0])
+       [palm]──[right finger]──► t   (right contact at [0, +half_w, 0])
+palm centre at [-depth, 0, 0]; arm extends to [-depth-0.04, 0, 0]
+```
+
+**To use a grasp with a robot arm:**
+1. Hand-eye calibration: transform `t` and `R` from camera frame to robot base frame
+2. Open gripper to `width + margin`
+3. Move to pre-grasp: `t_base + R_base[:,0] * (−0.10)` (10 cm before contact)
+4. Linear approach along `R_base[:,0]` to TCP target: `t_base + R_base[:,0] * (−depth)`
+5. Close gripper → lift
+
 ### Key Files
 - `models/graspnet.py` — full network, `pred_decode()`
 - `models/backbone.py` — PointNet2 (SA + FP layers)
@@ -172,7 +220,12 @@ After model inference, the node applies:
 - `graspnet_ros2/graspnet_ros2/graspnet_node.py` — ROS2 node (GraspNetNode)
 - `graspnet_ros2/launch/graspnet.launch.py` — launch file with parameter defaults
 - `graspnet_ros2/scripts/make_workspace_mask.py` — interactive rectangular mask creator
+- `demo_ros2.py` (repo root) — lightweight standalone validation node (no colcon needed); trigger-based, publishes markers + pointcloud
 - `graspnet_node.py` (repo root) — older standalone ROS2 node, superseded by `graspnet_ros2/`
+
+### Gripper Marker Geometry Note
+
+`_make_gripper_marker` / `_make_gripper_marker_rgb` in both `demo_ros2.py` and `graspnet_node.py` use the corrected `pts_local` convention where **finger contacts are at local origin** (`[0, ±half_w, 0]`) and palm is at `[-depth, 0, 0]`. The previous convention (palm at origin, tips at `[+depth, ±half_w, 0]`) caused finger lines to visually penetrate the object because `t` is a surface seed point and `+depth` goes inward. Do not revert this.
 
 ### Dataset Splits
 - Train: scenes 0–99
